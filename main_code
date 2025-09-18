@@ -1,0 +1,284 @@
+// Define BLYNK_TEMPLATE_ID and BLYNK_TEMPLATE_NAME
+#define BLYNK_TEMPLATE_ID "PUT ID HERE"
+#define BLYNK_TEMPLATE_NAME "PUT name here"
+
+// Define Blynk Virtual Pins
+#define VIRTUAL_PIN_POWER V0 // Fan On/Off button
+#define VIRTUAL_PIN_SPEED V1 // Slider or buttons for speeds
+#define VIRTUAL_PIN_TIMER V2 // Slider or buttons for timer
+#define VIRTUAL_PIN_STATUS V3 // To display fan status and speed in Blynk
+#define VIRTUAL_PIN_TIMER_STATUS V4 // To display timer status in Blynk
+
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <BlynkSimpleEsp8266.h>
+#include <IRremoteESP8266.h>
+#include <IRrecv.h>
+#include <IRutils.h>
+
+// WiFi credentials
+char auth[] = "PUT AUTH TOKEN";
+char ssid[] = "PUT name of WIFI";
+char pass[] = "PUT PASSWORD";
+
+// Relay pins
+const int RELAY_OFF_PIN = D1;    // GPIO5
+const int RELAY_SPEED1_PIN = D3; // GPIO0
+const int RELAY_SPEED2_PIN = D4; // GPIO2
+const int RELAY_SPEED3_PIN = D5; // GPIO14
+
+const int IR_RECEIVE_PIN = D2; // GPIO4 - IR receiver
+IRrecv irrecv(IR_RECEIVE_PIN);
+decode_results results;
+
+// IR remote codes
+const unsigned long IR_CODE_POWER_TOGGLE = 0x965AA25D;
+const unsigned long IR_CODE_TOGGLE_SPEED = 0x965AE21D;
+const unsigned long IR_CODE_TOGGLE_TIMER = 0x965AE01F;
+
+// Fan state variables
+int currentFanSpeed = 0; // 0 = Off, 1 = Speed1, 2 = Speed2, 3 = Speed3
+bool isFanOn = false;
+
+// Timer variables
+const int TIMER_DURATIONS_MINUTES[] = {0, 60, 120, 240, 480};
+const int NUM_TIMER_OPTIONS = sizeof(TIMER_DURATIONS_MINUTES) / sizeof(TIMER_DURATIONS_MINUTES[0]);
+int currentTimerIndex = 0;
+unsigned long timerStartTime = 0;
+unsigned long timerDurationMillis = 0;
+
+// WiFi and Blynk status
+bool isBlynkConnected = false;
+unsigned long lastWiFiCheck = 0;
+const unsigned long WIFI_CHECK_INTERVAL = 30000; // Check WiFi every 30 seconds
+
+// Function to set fan speed
+void setFanSpeed(int speed) {
+  turnOffAllRelays();
+  currentFanSpeed = speed;
+
+  switch (speed) {
+    case 0:
+      digitalWrite(RELAY_OFF_PIN, LOW);
+      isFanOn = false;
+      if (isBlynkConnected) Blynk.virtualWrite(VIRTUAL_PIN_STATUS, "Fan: OFF");
+      break;
+    case 1:
+      digitalWrite(RELAY_SPEED1_PIN, LOW);
+      isFanOn = true;
+      if (isBlynkConnected) Blynk.virtualWrite(VIRTUAL_PIN_STATUS, "Fan: Speed 1");
+      break;
+    case 2:
+      digitalWrite(RELAY_SPEED2_PIN, LOW);
+      isFanOn = true;
+      if (isBlynkConnected) Blynk.virtualWrite(VIRTUAL_PIN_STATUS, "Fan: Speed 2");
+      break;
+    case 3:
+      digitalWrite(RELAY_SPEED3_PIN, LOW);
+      isFanOn = true;
+      if (isBlynkConnected) Blynk.virtualWrite(VIRTUAL_PIN_STATUS, "Fan: Speed 3");
+      break;
+  }
+}
+
+// Turn off all relays
+void turnOffAllRelays() {
+  digitalWrite(RELAY_OFF_PIN, HIGH);
+  digitalWrite(RELAY_SPEED1_PIN, HIGH);
+  digitalWrite(RELAY_SPEED2_PIN, HIGH);
+  digitalWrite(RELAY_SPEED3_PIN, HIGH);
+  delay(100);
+}
+
+// Turn off fan and reset state
+void turnOffFan() {
+  setFanSpeed(0);
+  timerDurationMillis = 0;
+  currentTimerIndex = 0;
+  if (isBlynkConnected) Blynk.virtualWrite(VIRTUAL_PIN_TIMER_STATUS, "Timer: OFF");
+}
+
+// Blynk Power Button Handler
+BLYNK_WRITE(VIRTUAL_PIN_POWER) {
+  int pinValue = param.asInt();
+  if (pinValue == 1) {
+    if (isFanOn) {
+      turnOffFan();
+      Serial.println("Fan OFF from Blynk");
+    } else {
+      setFanSpeed(1);
+      Serial.println("Fan ON from Blynk - Speed 1");
+    }
+    Blynk.virtualWrite(VIRTUAL_PIN_POWER, 0); // Reset button
+  }
+}
+
+// Blynk Speed Control Handler
+BLYNK_WRITE(VIRTUAL_PIN_SPEED) {
+  int speed = param.asInt();
+  if (speed >= 0 && speed <= 3) {
+    setFanSpeed(speed);
+    Serial.print("Fan Speed changed from Blynk to: ");
+    Serial.println(speed);
+  }
+}
+
+// Blynk Timer Control Handler
+BLYNK_WRITE(VIRTUAL_PIN_TIMER) {
+  int timerOption = param.asInt();
+  if (timerOption >= 0 && timerOption < NUM_TIMER_OPTIONS) {
+    currentTimerIndex = timerOption;
+    int selectedTimerMinutes = TIMER_DURATIONS_MINUTES[currentTimerIndex];
+
+    if (selectedTimerMinutes == 0) {
+      timerDurationMillis = 0;
+      Serial.println("Timer OFF from Blynk");
+      if (isBlynkConnected) Blynk.virtualWrite(VIRTUAL_PIN_TIMER_STATUS, "Timer: OFF");
+    } else {
+      timerDurationMillis = (unsigned long)selectedTimerMinutes * 60 * 1000;
+      timerStartTime = millis();
+      Serial.print("Timer set from Blynk to: ");
+      Serial.print(selectedTimerMinutes);
+      Serial.println(" minutes");
+      if (isBlynkConnected) Blynk.virtualWrite(VIRTUAL_PIN_TIMER_STATUS, String("Timer: ") + selectedTimerMinutes + " min");
+    }
+  }
+}
+
+// Attempt to connect to WiFi and Blynk
+void connectToWiFiAndBlynk() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Attempting to connect to WiFi...");
+    WiFi.begin(ssid, pass);
+    unsigned long startTime = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startTime < 10000) {
+      delay(500);
+      Serial.print(".");
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\nWiFi connected");
+    } else {
+      Serial.println("\nWiFi connection failed");
+      return;
+    }
+  }
+
+  if (!Blynk.connected()) {
+    Serial.println("Attempting to connect to Blynk...");
+    Blynk.config(auth);
+    if (Blynk.connect(10000)) { // 10-second timeout
+      Serial.println("Blynk connected");
+      isBlynkConnected = true;
+      // Sync initial state
+      Blynk.virtualWrite(VIRTUAL_PIN_STATUS, isFanOn ? String("Fan: Speed ") + currentFanSpeed : "Fan: OFF");
+      Blynk.virtualWrite(VIRTUAL_PIN_TIMER_STATUS, currentTimerIndex == 0 ? "Timer: OFF" : String("Timer: ") + TIMER_DURATIONS_MINUTES[currentTimerIndex] + " min");
+    } else {
+      Serial.println("Blynk connection failed");
+      isBlynkConnected = false;
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize relay pins
+  pinMode(RELAY_OFF_PIN, OUTPUT);
+  pinMode(RELAY_SPEED1_PIN, OUTPUT);
+  pinMode(RELAY_SPEED2_PIN, OUTPUT);
+  pinMode(RELAY_SPEED3_PIN, OUTPUT);
+
+  // Turn off all relays
+  turnOffAllRelays();
+
+  // Enable IR receiver
+  irrecv.enableIRIn();
+  Serial.println("IR Receiver Enabled.");
+
+  // Initial WiFi and Blynk connection attempt
+  connectToWiFiAndBlynk();
+}
+
+void loop() {
+  // Run Blynk only if connected
+  if (isBlynkConnected) {
+    Blynk.run();
+  }
+
+  // Periodically check WiFi and Blynk connection
+  if (millis() - lastWiFiCheck >= WIFI_CHECK_INTERVAL) {
+    if (WiFi.status() != WL_CONNECTED || !Blynk.connected()) {
+      isBlynkConnected = false;
+      connectToWiFiAndBlynk();
+    }
+    lastWiFiCheck = millis();
+  }
+
+  // IR command processing
+  if (irrecv.decode(&results)) {
+    Serial.print("Received IR code: 0x");
+    Serial.println(results.value, HEX);
+
+    if (results.value == 0xFFFFFFFF || results.decode_type == kRepeat) {
+      Serial.println("Ignoring IR repeat code...");
+      irrecv.resume();
+      return;
+    }
+
+    // Power toggle
+    if (results.value == IR_CODE_POWER_TOGGLE) {
+      if (isFanOn) {
+        turnOffFan();
+        Serial.println("Fan OFF (IR)");
+      } else {
+        setFanSpeed(1);
+        Serial.println("Fan ON (IR) - Speed 1");
+      }
+    }
+    // Speed toggle
+    else if (results.value == IR_CODE_TOGGLE_SPEED) {
+      if (isFanOn) {
+        currentFanSpeed++;
+        if (currentFanSpeed > 3) currentFanSpeed = 1;
+        setFanSpeed(currentFanSpeed);
+        Serial.print("Fan Speed changed by IR to: ");
+        Serial.println(currentFanSpeed);
+      } else {
+        Serial.println("Fan is OFF. Press Power Toggle to turn ON first (IR).");
+      }
+    }
+    // Timer toggle
+    else if (results.value == IR_CODE_TOGGLE_TIMER) {
+      currentTimerIndex++;
+      if (currentTimerIndex >= NUM_TIMER_OPTIONS) {
+        currentTimerIndex = 0;
+      }
+      int selectedTimerMinutes = TIMER_DURATIONS_MINUTES[currentTimerIndex];
+      if (selectedTimerMinutes == 0) {
+        timerDurationMillis = 0;
+        Serial.println("Timer OFF by IR");
+        if (isBlynkConnected) Blynk.virtualWrite(VIRTUAL_PIN_TIMER_STATUS, "Timer: OFF");
+      } else {
+        
+        timerDurationMillis = (unsigned long)selectedTimerMinutes * 60 * 1000;
+        timerStartTime = millis();
+        Serial.print("Timer set by IR to: ");
+        Serial.print(selectedTimerMinutes);
+        Serial.println(" minutes");
+        if (isBlynkConnected) Blynk.virtualWrite(VIRTUAL_PIN_TIMER_STATUS, String("Timer: ") + selectedTimerMinutes + " min");
+      }
+    }
+
+    irrecv.resume();
+  }
+
+  // Timer processing
+  if (timerDurationMillis > 0 && isFanOn) {
+    if (millis() - timerStartTime >= timerDurationMillis) {
+      Serial.println("Timer expired! Turning fan OFF.");
+      turnOffFan();
+      timerDurationMillis = 0;
+      currentTimerIndex = 0;
+    }
+  }
+}
